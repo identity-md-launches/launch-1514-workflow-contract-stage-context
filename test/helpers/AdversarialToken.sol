@@ -14,6 +14,7 @@ contract AdversarialToken is ERC20 {
     uint8 private immutable _decimals;
     ReturnMode public mode;
     address public rejectTo;
+    address public falseReturnTo;
     bool public taxed;
     address public callbackTarget;
     bytes public callbackData;
@@ -44,10 +45,16 @@ contract AdversarialToken is ERC20 {
         callbackData = data;
     }
 
+    /// @dev Move the tokens first, then report failure on outgoing transfers only.
+    /// This distinguishes a failed burn/payout from a failed incoming payment.
+    function setFalseReturnTo(address recipient) external {
+        falseReturnTo = recipient;
+    }
+
     function transfer(address to, uint256 amount) public override returns (bool) {
         if (to == rejectTo) revert TransferRejected();
         super.transfer(to, amount);
-        return _afterTransfer();
+        return _afterTransfer() && to != falseReturnTo;
     }
 
     function transferFrom(address from, address to, uint256 amount) public override returns (bool) {

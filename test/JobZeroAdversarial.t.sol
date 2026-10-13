@@ -256,4 +256,139 @@ contract JobZeroAdversarialTest is Test {
         assertFalse(token.callbackSuccess());
         assertEq(token.callbackResult(), abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector));
     }
+
+    function test_FalseOutgoingQueueBurnRestoresPaymentAllowanceAndLinks() public {
+        vm.prank(alice);
+        job.open();
+        vm.prank(bob);
+        job.goOnline();
+        bytes32 queueBefore = keccak256(abi.encode(job.getQueue(1, 0, 100)));
+        uint256 balanceBefore = token.balanceOf(carol);
+        uint256 allowanceBefore = token.allowance(carol, address(job));
+        token.setFalseReturnTo(BURN);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(token)));
+        vm.prank(carol);
+        job.goOnline();
+        assertEq(token.balanceOf(carol), balanceBefore);
+        assertEq(token.allowance(carol, address(job)), allowanceBefore);
+        assertEq(token.balanceOf(BURN), 10 ether);
+        assertEq(job.totalBurned(), 10 ether);
+        assertEq(job.totalLiability(), 10_000 ether);
+        assertEq(token.balanceOf(address(job)), 10_000 ether);
+        assertEq(keccak256(abi.encode(job.getQueue(1, 0, 100))), queueBefore);
+        assertFalse(job.hasJoinedQueue(1, carol));
+        assertFalse(job.isOnline(1, carol));
+        token.setFalseReturnTo(address(0));
+        vm.prank(carol);
+        job.goOnline();
+        vm.prank(bob);
+        job.goOffline();
+        assertEq(job.queueLength(1), 1);
+        assertEq(job.getQueue(1, 0, 1)[0].worker, carol);
+        assertEq(token.balanceOf(BURN), 20 ether);
+    }
+
+    function test_FalseOutgoingHandoffBurnRestoresBothTransfersAndAttemptHistory() public {
+        vm.prank(alice);
+        job.open();
+        vm.prank(bob);
+        job.goOnline();
+        bytes32 runBefore = keccak256(abi.encode(job.runs(1), job.getAttempts(1, 0, 100)));
+        uint256 balanceBefore = token.balanceOf(alice);
+        uint256 allowanceBefore = token.allowance(alice, address(job));
+        token.setFalseReturnTo(BURN);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(token)));
+        vm.prank(alice);
+        job.handoff(bob);
+        assertEq(keccak256(abi.encode(job.runs(1), job.getAttempts(1, 0, 100))), runBefore);
+        assertEq(token.balanceOf(alice), balanceBefore);
+        assertEq(token.allowance(alice, address(job)), allowanceBefore);
+        assertEq(token.balanceOf(address(job)), 10_000 ether);
+        assertEq(token.balanceOf(BURN), 10 ether);
+        assertEq(job.totalBurned(), 10 ether);
+        assertEq(job.totalLiability(), 10_000 ether);
+        assertEq(job.biggestBounty(), 10_000 ether);
+        assertEq(job.mostHandoffs(), 0);
+        assertTrue(job.isOnline(1, bob));
+        assertFalse(job.hasHeld(1, bob));
+        (uint256 attempts,,,) = job.workerStats(bob);
+        assertEq(attempts, 0);
+        token.setFalseReturnTo(address(0));
+        vm.prank(alice);
+        job.handoff(bob);
+        assertEq(job.worker(), bob);
+    }
+
+    function test_FailedDustBurnCannotPartiallyCloseRunOrCreateClaims() public {
+        address finalWorker = makeAddr("dust failure worker");
+        vm.prank(alice);
+        job.open();
+        vm.prank(alice);
+        job.handoff(bob);
+        vm.prank(bob);
+        job.handoff(carol);
+        vm.prank(carol);
+        job.handoff(finalWorker);
+        uint256 bounty = job.runs(1).bounty;
+        uint256 dust = bounty % 3;
+        assertGt(dust, 0, "must exercise the outgoing dust transfer");
+        uint256 burnedBefore = token.balanceOf(BURN);
+        vm.warp(job.deadline() + 30 days);
+        bytes32 runBefore = keccak256(abi.encode(job.runs(1), job.getAttempts(1, 0, 100)));
+        token.setFalseReturnTo(BURN);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(token)));
+        job.timeout();
+        assertEq(keccak256(abi.encode(job.runs(1), job.getAttempts(1, 0, 100))), runBefore);
+        assertTrue(job.isOpen());
+        assertEq(job.claimable(1, alice), 0);
+        assertEq(job.totalLiability(), bounty);
+        assertEq(token.balanceOf(address(job)), bounty);
+        assertEq(token.balanceOf(BURN), burnedBefore);
+        assertEq(job.totalBurned(), burnedBefore);
+        (,,, uint256 failed) = job.workerStats(finalWorker);
+        assertEq(failed, 0);
+        token.setFalseReturnTo(address(0));
+        job.timeout();
+        assertEq(token.balanceOf(BURN), burnedBefore + dust);
+        assertEq(job.totalLiability(), bounty - dust);
+        assertEq(job.claimable(1, alice), bounty / 3);
+        assertEq(job.claimable(1, bob), bounty / 3);
+        assertEq(job.claimable(1, carol), bounty / 3);
+        assertEq(job.claimable(1, finalWorker), 0);
+        vm.prank(alice);
+        job.claim(1);
+        vm.prank(bob);
+        job.claim(1);
+        vm.prank(carol);
+        job.claim(1);
+        assertEq(token.balanceOf(address(job)), 0);
+        assertEq(job.totalLiability(), 0);
+    }
+
+    function test_FalseOutgoingPayoutRestoresRecipientBalanceAndEntitlement() public {
+        vm.prank(alice);
+        job.open();
+        vm.prank(alice);
+        job.handoff(bob);
+        vm.warp(job.deadline());
+        job.timeout();
+        uint256 balanceBefore = token.balanceOf(alice);
+        token.setFalseReturnTo(alice);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(token)));
+        vm.prank(alice);
+        job.claim(1);
+        assertEq(token.balanceOf(alice), balanceBefore);
+        assertEq(token.balanceOf(address(job)), 10_500 ether);
+        assertEq(job.totalLiability(), 10_500 ether);
+        assertFalse(job.claimed(1, alice));
+        assertEq(job.runs(1).claimedCount, 0);
+        assertEq(job.claimable(1, alice), 10_500 ether);
+        (,, uint256 earned,) = job.workerStats(alice);
+        assertEq(earned, 0);
+        token.setFalseReturnTo(address(0));
+        vm.prank(alice);
+        job.claim(1);
+        assertEq(token.balanceOf(alice), balanceBefore + 10_500 ether);
+        assertEq(job.totalLiability(), 0);
+    }
 }

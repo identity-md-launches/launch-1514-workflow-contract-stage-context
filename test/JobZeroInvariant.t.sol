@@ -27,7 +27,12 @@ contract JobZeroHandler is Test {
     mapping(address => uint256) public attempts;
     mapping(address => uint256) public handoffs;
     mapping(address => uint256) public earned;
+    mapping(address => uint256) public spent;
     mapping(address => uint256) public failures;
+    mapping(uint256 => uint256[]) private _startedAt;
+    mapping(uint256 => uint256) public closedAt;
+    mapping(uint256 => uint256) public closingFee;
+    mapping(uint256 => mapping(address => uint256)) public joinedAt;
 
     constructor(JobZero job_, LaunchToken token_) {
         job = job_;
@@ -48,6 +53,7 @@ contract JobZeroHandler is Test {
         currentFee = 1_000 ether;
         bounty[runCount] = 10_000 ether;
         payments += 10_000 ether;
+        spent[wallet] += 10_000 ether;
         _recordWorker(wallet);
     }
 
@@ -61,6 +67,7 @@ contract JobZeroHandler is Test {
         job.handoff(to);
         vm.stopPrank();
         payments += currentFee;
+        spent[from] += currentFee;
         burns += currentFee / 2;
         bounty[runCount] += currentFee - currentFee / 2;
         currentFee = currentFee * 103 / 100;
@@ -79,8 +86,10 @@ contract JobZeroHandler is Test {
         vm.stopPrank();
         joined[runCount][wallet] = true;
         online[runCount][wallet] = true;
+        joinedAt[runCount][wallet] = vm.getBlockTimestamp();
         _joinOrder[runCount].push(wallet);
         payments += 10 ether;
+        spent[wallet] += 10 ether;
         burns += 10 ether;
     }
 
@@ -99,11 +108,13 @@ contract JobZeroHandler is Test {
 
     function expireAndTimeout(uint256 delaySeed) external {
         if (runCount == 0 || closed[runCount]) return;
-        uint256 expiry = job.deadline();
+        uint256 expiry = _expectedDeadline();
         if (vm.getBlockTimestamp() < expiry) vm.warp(expiry);
         vm.warp(vm.getBlockTimestamp() + (delaySeed % 3 days));
         job.timeout();
         closed[runCount] = true;
+        closedAt[runCount] = vm.getBlockTimestamp();
+        closingFee[runCount] = currentFee;
         uint256 length = _workers[runCount].length;
         failures[_workers[runCount][length - 1]]++;
         burns += length == 1 ? bounty[runCount] : bounty[runCount] % (length - 1);
@@ -130,6 +141,7 @@ contract JobZeroHandler is Test {
         vm.prank(actors[seed % actors.length]);
         token.transfer(address(job), amount);
         donations += amount;
+        spent[actors[seed % actors.length]] += amount;
     }
 
     function workers(uint256 id) external view returns (address[] memory) {
@@ -140,17 +152,80 @@ contract JobZeroHandler is Test {
         return _joinOrder[id];
     }
 
+    function startedAt(uint256 id) external view returns (uint256[] memory) {
+        return _startedAt[id];
+    }
+
+    /// @dev Invalid transitions are exercised between successful operations, not filtered out.
+    /// Reverts must match the specific guard; the ledger deliberately remains unchanged.
+    function rejectInvalidAction(uint256 seed) external {
+        address wallet = actors[seed % actors.length];
+        uint256 action = (seed / actors.length) % 8;
+        if (action == 0) {
+            address configuredOwner = job.owner();
+            vm.expectRevert(JobZero.TokenAlreadySet.selector);
+            vm.prank(configuredOwner);
+            job.setToken(address(token));
+        } else if (action == 1) {
+            vm.expectRevert(JobZero.Unauthorized.selector);
+            vm.prank(wallet);
+            job.setToken(address(token));
+        } else if (runCount == 0 || closed[runCount]) {
+            vm.expectRevert(JobZero.NoOpenRun.selector);
+            vm.prank(wallet);
+            if (action % 3 == 0) job.timeout();
+            else if (action % 3 == 1) job.handoff(wallet);
+            else job.goOnline();
+        } else if (action == 2) {
+            vm.expectRevert(JobZero.RunAlreadyOpen.selector);
+            vm.prank(wallet);
+            job.open();
+        } else if (action == 3) {
+            address current = _workers[runCount][_workers[runCount].length - 1];
+            if (wallet == current) wallet = actors[(seed % actors.length + 1) % actors.length];
+            vm.expectRevert(JobZero.NotWorker.selector);
+            vm.prank(wallet);
+            job.handoff(current);
+        } else if (action == 4) {
+            vm.expectRevert(JobZero.NothingToClaim.selector);
+            vm.prank(wallet);
+            job.claim(runCount);
+        } else if (action == 5 && _canAct()) {
+            vm.expectRevert(JobZero.DeadlineNotReached.selector);
+            vm.prank(wallet);
+            job.timeout();
+        } else {
+            address current = _workers[runCount][_workers[runCount].length - 1];
+            address first = _workers[runCount][0];
+            bytes4 reason = !_canAct()
+                ? JobZero.DeadlinePassed.selector
+                : first == current ? JobZero.InvalidRecipient.selector : JobZero.AlreadyHeld.selector;
+            vm.expectRevert(reason);
+            vm.prank(current);
+            job.handoff(first);
+        }
+    }
+
     function _canAct() private view returns (bool) {
-        return runCount != 0 && !closed[runCount] && vm.getBlockTimestamp() < job.deadline();
+        return runCount != 0 && !closed[runCount] && vm.getBlockTimestamp() < _expectedDeadline();
+    }
+
+    function _expectedDeadline() private view returns (uint256) {
+        uint256[] storage times = _startedAt[runCount];
+        return times[times.length - 1] + 1 days;
     }
 
     function _recordWorker(address wallet) private {
         _workers[runCount].push(wallet);
+        _startedAt[runCount].push(vm.getBlockTimestamp());
         held[runCount][wallet] = true;
         attempts[wallet]++;
     }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 96
+/// forge-config: default.invariant.fail-on-revert = true
 contract JobZeroInvariantTest is Test {
     LaunchToken private token;
     JobZero private job;
@@ -166,7 +241,15 @@ contract JobZeroInvariantTest is Test {
         for (uint256 i; i < 8; i++) {
             token.transfer(handler.actors(i), 5_000_000 ether);
         }
-        bytes4[] memory selectors = new bytes4[](8);
+        // Begin with both a historical entitlement and a live run. Even short sequences
+        // exercise cross-run isolation; the existing unit tests cover the empty state.
+        handler.open(0);
+        handler.join(1);
+        handler.handoff(1);
+        handler.expireAndTimeout(0);
+        handler.open(2);
+        handler.join(3);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.open.selector;
         selectors[1] = handler.handoff.selector;
         selectors[2] = handler.join.selector;
@@ -175,6 +258,7 @@ contract JobZeroInvariantTest is Test {
         selectors[5] = handler.expireAndTimeout.selector;
         selectors[6] = handler.claim.selector;
         selectors[7] = handler.donate.selector;
+        selectors[8] = handler.rejectInvalidAction.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
@@ -188,7 +272,10 @@ contract JobZeroInvariantTest is Test {
         assertEq(token.balanceOf(address(job)), liabilities + handler.donations());
         uint256 userBalances;
         for (uint256 i; i < 8; i++) {
-            userBalances += token.balanceOf(handler.actors(i));
+            address wallet = handler.actors(i);
+            uint256 balance = token.balanceOf(wallet);
+            assertEq(balance, 5_000_000 ether + handler.earned(wallet) - handler.spent(wallet));
+            userBalances += balance;
         }
         assertEq(userBalances, 40_000_000 ether - handler.payments() - handler.donations() + handler.payouts());
     }
@@ -206,10 +293,20 @@ contract JobZeroInvariantTest is Test {
         assertEq(job.totalLiability(), 0);
         assertEq(token.balanceOf(address(job)), handler.donations());
         assertEq(handler.payments(), handler.burns() + handler.payouts());
+        invariant_ConservationAndExactLiabilities();
+        invariant_RunRecordsClaimEligibilityAndWalletStatsMatchHistory();
+        invariant_AttemptHistoryDeadlinesAndRecordsMatchTheClock();
     }
 
     function invariant_RunRecordsClaimEligibilityAndWalletStatsMatchHistory() public view {
+        uint256 outstanding;
         assertEq(job.currentRun(), handler.runCount());
+        assertEq(job.isOpen(), !handler.closed(handler.runCount()));
+        if (!job.isOpen()) {
+            assertEq(job.worker(), address(0));
+            assertEq(job.deadline(), 0);
+            assertEq(job.handoffFee(), 1_000 ether);
+        }
         for (uint256 id = 1; id <= handler.runCount(); ++id) {
             address[] memory workers = handler.workers(id);
             JobZero.Run memory run = job.runs(id);
@@ -226,18 +323,26 @@ contract JobZeroInvariantTest is Test {
                     expected = handler.bounty(id) / (workers.length - 1);
                 }
                 assertEq(job.claimable(id, wallet), expected);
+                outstanding += expected;
                 if (handler.paid(id, wallet)) claims++;
             }
             assertEq(run.claimedCount, claims);
+            uint256 expectedShare = run.closed && workers.length > 1 ? handler.bounty(id) / (workers.length - 1) : 0;
+            assertEq(run.share, expectedShare);
+            assertEq(run.worker, workers[workers.length - 1]);
             if (run.closed) {
                 assertEq(run.failedWorker, workers[workers.length - 1]);
+                assertEq(run.fee, handler.closingFee(id));
             } else {
+                outstanding += handler.bounty(id);
+                assertEq(run.failedWorker, address(0));
                 assertEq(id, handler.runCount());
                 assertTrue(job.isOpen());
                 assertEq(job.worker(), workers[workers.length - 1]);
                 assertEq(job.handoffFee(), handler.currentFee());
             }
         }
+        assertEq(job.totalLiability(), outstanding);
         for (uint256 i; i < 8; i++) {
             address wallet = handler.actors(i);
             (uint256 attempts, uint256 handoffs, uint256 earned, uint256 failed) = job.workerStats(wallet);
@@ -262,6 +367,7 @@ contract JobZeroInvariantTest is Test {
                     if (handler.online(id, wallet)) {
                         assertLt(count, entries.length);
                         assertEq(entries[count].worker, wallet);
+                        assertEq(entries[count].onlineAt, handler.joinedAt(id, wallet));
                         assertFalse(job.hasHeld(id, wallet));
                         count++;
                     }
@@ -275,5 +381,54 @@ contract JobZeroInvariantTest is Test {
                 assertEq(job.isOnline(id, wallet), !handler.closed(id) && handler.online(id, wallet));
             }
         }
+    }
+
+    /// @dev Expected times come from handler calls, not JobZero's own deadline or attempt views.
+    function invariant_AttemptHistoryDeadlinesAndRecordsMatchTheClock() public view {
+        uint256 largestBounty;
+        uint256 mostHandoffs;
+        uint256 longestId;
+        uint256 longestDuration;
+        for (uint256 id = 1; id <= handler.runCount(); ++id) {
+            address[] memory workers = handler.workers(id);
+            uint256[] memory times = handler.startedAt(id);
+            JobZero.Run memory run = job.runs(id);
+            uint256 expectedDeadline = times[times.length - 1] + 1 days;
+            assertEq(run.openedAt, times[0]);
+            assertEq(run.deadline, expectedDeadline);
+            assertEq(run.closedAt, handler.closedAt(id));
+            if (!run.closed) assertEq(job.deadline(), expectedDeadline);
+            JobZero.Attempt[] memory page = job.getAttempts(id, 0, 100);
+            assertEq(page.length, workers.length);
+            for (uint256 i; i < workers.length; ++i) {
+                JobZero.Attempt memory attempt = page[workers.length - 1 - i];
+                assertEq(attempt.worker, workers[i]);
+                assertEq(attempt.startedAt, times[i]);
+                if (i + 1 < workers.length) {
+                    assertEq(uint256(attempt.status), uint256(JobZero.Status.HandedOff));
+                    assertEq(attempt.endedAt, times[i + 1]);
+                    assertLt(attempt.endedAt, attempt.startedAt + 1 days);
+                } else {
+                    assertEq(
+                        uint256(attempt.status), uint256(run.closed ? JobZero.Status.Failed : JobZero.Status.Holding)
+                    );
+                    assertEq(attempt.endedAt, run.closed ? expectedDeadline : 0);
+                }
+            }
+            if (handler.bounty(id) > largestBounty) largestBounty = handler.bounty(id);
+            if (workers.length - 1 > mostHandoffs) mostHandoffs = workers.length - 1;
+            uint256 end =
+                run.closed || vm.getBlockTimestamp() > expectedDeadline ? expectedDeadline : vm.getBlockTimestamp();
+            uint256 duration = end - times[0];
+            if (longestId == 0 || duration > longestDuration) {
+                longestId = id;
+                longestDuration = duration;
+            }
+        }
+        assertEq(job.biggestBounty(), largestBounty);
+        assertEq(job.mostHandoffs(), mostHandoffs);
+        (uint256 recordedId, uint256 recordedDuration) = job.longestRun();
+        assertEq(recordedId, longestId);
+        assertEq(recordedDuration, longestDuration);
     }
 }
