@@ -1,0 +1,22 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Teyo",
+    "symbol": "TEYO",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "JobZero",
+      "constructorArgs": ["$owner"]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "JobZero manages JOB #0 runs, 24-hour handoffs, worker queues and claimable TEYO bounties. Its constructor sets the immutable launch owner through $owner. After deployment, that owner must call setToken once with this launch's deployed LaunchToken address from the verified deployment handoff; gameplay remains unavailable until then. This is the owner's only privileged operation, and the token choice is irreversible. The factory makes no initialization calls and supplies the liquidity pool, MerkleDistributor and initialization-only PoolInitializationGuard. The pool fee is 1.25%. The manifest initialPrice is the prescribed reference value; the deployer derives the effective opening price from the policy's 2,500 IMD opening market cap and deployed token ordering."
+}
